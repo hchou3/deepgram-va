@@ -1,4 +1,8 @@
-const { createClient, LiveTranscriptionEvents } = require("@deepgram/sdk");
+const {
+  createClient,
+  LiveTranscriptionEvents,
+  AgentEvents,
+} = require("@deepgram/sdk");
 
 const fetch = require("cross-fetch");
 const path = require("path");
@@ -6,36 +10,70 @@ const dotenv = require("dotenv");
 dotenv.config({ path: path.resolve(__dirname, "../.env") });
 const url = process.env.DEEPGRAM_URL;
 
-const stream = async () => {
-  const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
-  const connection = deepgram.listen.live({
-    model: "nova-3",
-    language: "en-US",
-    smart_format: true,
+const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
+
+async function connectToVoice() {
+  const agent = deepgram.agent();
+
+  agent.on(AgentEvents.Open, () => {
+    console.log("Connection opened");
+
+    agent.configure({
+      audio: {
+        input: {
+          encoding: "linear16",
+          sampleRate: 16000,
+        },
+        output: {
+          encoding: "linear16",
+          container: "wav",
+          sampleRate: 24000,
+        },
+      },
+      agent: {
+        listen: {
+          model: "nova-3",
+        },
+        speak: {
+          model: "aura-asteria-en",
+        },
+        think: {
+          provider: {
+            type: "anthropic",
+          },
+          model: "claude-3-haiku-20240307",
+          instructions:
+            "You are a helpful AI assistant. Keep responses brief and friendly.",
+        },
+      },
+    });
   });
 
-  connection.on(LiveTranscriptionEvents.Open, () => {
-    connection.on(LiveTranscriptionEvents.Close, () => {
-      console.log("Connection closed");
-    });
-    connection.on(LiveTranscriptionEvents.Transcript, (data) => {
-      console.log(data.channel.alternatives[0].transcript);
-    });
-    connection.on(LiveTranscriptionEvents.Metadata, (data) => {
-      console.log(data);
-    });
-    connection.on(LiveTranscriptionEvents.Error, (error) => {
-      console.error("Error:", error);
-    });
-
-    fetch(url)
-      .then((r) => r.body)
-      .then((res) => {
-        res.on("readable", () => {
-          connection.send(res.read());
-        });
-      });
+  agent.on(AgentEvents.AgentStartedSpeaking, (data) => {
+    console.log("Agent started speaking:", data["total_latency"]);
   });
-};
 
-stream();
+  agent.on(AgentEvents.ConversationText, (message) => {
+    console.log(`${message.role} said: ${message.content}`);
+  });
+
+  agent.on(AgentEvents.Audio, (audio) => {
+    playAudio(audio);
+  });
+
+  agent.on(AgentEvents.Error, (error) => {
+    console.error("Error:", error);
+  });
+
+  agent.on(AgentEvents.Close, () => {
+    console.log("Connection closed");
+  });
+
+  function sendAudioData(audioData) {
+    agent.send(audioData);
+  }
+
+  setInterval(() => {
+    agent.keepAlive();
+  }, 8000);
+}
