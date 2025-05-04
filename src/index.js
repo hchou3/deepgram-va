@@ -1,11 +1,7 @@
-const {
-  createClient,
-  LiveTranscriptionEvents,
-  AgentEvents,
-} = require("@deepgram/sdk");
+const { createClient, AgentEvents } = require("@deepgram/sdk");
+import { prompt } from "./prompt.js";
 
 const fetch = require("cross-fetch");
-const path = require("path");
 const dotenv = require("dotenv");
 dotenv.config({ path: path.resolve(__dirname, "../.env") });
 const url = process.env.DEEPGRAM_URL;
@@ -14,8 +10,10 @@ const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
 
 async function connectToVoice() {
   const agent = deepgram.agent();
+  let audioBuffer = Buffer.alloc(0);
+  let i = 0;
 
-  agent.on(AgentEvents.Open, () => {
+  agent.on(AgentEvents.Open, async () => {
     console.log("Connection opened");
 
     agent.configure({
@@ -42,11 +40,23 @@ async function connectToVoice() {
             type: "anthropic",
           },
           model: "claude-3-haiku-20240307",
-          instructions:
-            "You are a helpful AI assistant. Keep responses brief and friendly.",
+          instructions: { prompt },
         },
       },
     });
+    console.log("Agent configured");
+
+    setInterval(() => {
+      console.log("Keep alive!");
+      void agent.keepAlive();
+    }, 5000);
+    fetch(url)
+      .then((r) => r.body)
+      .then((res) => {
+        res.on("readable", () => {
+          agent.send(res.read());
+        });
+      });
   });
 
   agent.on(AgentEvents.AgentStartedSpeaking, (data) => {
@@ -58,22 +68,17 @@ async function connectToVoice() {
   });
 
   agent.on(AgentEvents.Audio, (audio) => {
-    playAudio(audio);
+    const buffer = Buffer.from(audio);
+    audioBuffer = Buffer.concat([audioBuffer, buffer]);
   });
 
   agent.on(AgentEvents.Error, (error) => {
     console.error("Error:", error);
+    console.error(err);
+    console.error(err.message);
   });
 
   agent.on(AgentEvents.Close, () => {
     console.log("Connection closed");
   });
-
-  function sendAudioData(audioData) {
-    agent.send(audioData);
-  }
-
-  setInterval(() => {
-    agent.keepAlive();
-  }, 8000);
 }
