@@ -1,31 +1,40 @@
-const { createClient, AgentEvents } = require("@deepgram/sdk");
+import { createClient, AgentEvents } from "@deepgram/sdk";
 import { prompt } from "./prompt.js";
+import dotenv from "dotenv";
+import path from "path";
+import { fileURLToPath } from "url";
+import { WebSocketServer } from "ws";
+import http from "http";
 
-const fetch = require("cross-fetch");
-const dotenv = require("dotenv");
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 dotenv.config({ path: path.resolve(__dirname, "../.env") });
-const url = process.env.DEEPGRAM_URL;
 
 const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
 
-async function connectToVoice() {
-  const agent = deepgram.agent();
-  let audioBuffer = Buffer.alloc(0);
-  let i = 0;
+const server = http.createServer();
+const wss = new WebSocketServer({ server });
+
+let agent = null;
+let audioBuffer = Buffer.alloc(0);
+
+async function initializeVoiceAgent() {
+  agent = deepgram.agent();
 
   agent.on(AgentEvents.Open, async () => {
     console.log("Connection opened");
 
-    agent.configure({
+    await agent.configure({
       audio: {
         input: {
           encoding: "linear16",
-          sampleRate: 16000,
+          sampleRate: 44100,
         },
         output: {
           encoding: "linear16",
+          sampleRate: 16000,
           container: "wav",
-          sampleRate: 24000,
         },
       },
       agent: {
@@ -40,23 +49,16 @@ async function connectToVoice() {
             type: "anthropic",
           },
           model: "claude-3-haiku-20240307",
-          instructions: { prompt },
+          instructions: prompt,
         },
       },
     });
-    console.log("Agent configured");
+    console.log("Voice agent configured");
 
     setInterval(() => {
       console.log("Keep alive!");
       void agent.keepAlive();
-    }, 5000);
-    fetch(url)
-      .then((r) => r.body)
-      .then((res) => {
-        res.on("readable", () => {
-          agent.send(res.read());
-        });
-      });
+    }, 8000);
   });
 
   agent.on(AgentEvents.AgentStartedSpeaking, (data) => {
@@ -65,20 +67,77 @@ async function connectToVoice() {
 
   agent.on(AgentEvents.ConversationText, (message) => {
     console.log(`${message.role} said: ${message.content}`);
+    // Broadcast to all connected clients
+    wss.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(
+          JSON.stringify({
+            type: "conversation",
+            data: message,
+          })
+        );
+      }
+    });
   });
 
   agent.on(AgentEvents.Audio, (audio) => {
     const buffer = Buffer.from(audio);
     audioBuffer = Buffer.concat([audioBuffer, buffer]);
+    wss.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(
+          JSON.stringify({
+            type: "audio",
+            data: buffer,
+          })
+        );
+      }
+    });
   });
 
   agent.on(AgentEvents.Error, (error) => {
-    console.error("Error:", error);
-    console.error(err);
-    console.error(err.message);
+    console.error("Voice agent error:", error);
+    wss.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(
+          JSON.stringify({
+            type: "error",
+            data: error.message,
+          })
+        );
+      }
+    });
   });
 
   agent.on(AgentEvents.Close, () => {
-    console.log("Connection closed");
+    console.log("Voice agent connection closed");
   });
 }
+
+// Handle WebSocket connections
+wss.on("connection", (ws) => {
+  console.log("Socket connected");
+
+  ws.on("message", (data) => {
+    if (agent) {
+      agent.send(data);
+    } else {
+      ws.send(
+        JSON.stringify({
+          type: "error",
+          data: "Voice agent not ready",
+        })
+      );
+    }
+  });
+
+  ws.on("close", () => {
+    console.log("Client disconnected");
+  });
+});
+
+const PORT = process.env.PORT || 8001;
+server.listen(PORT, () => {
+  console.log(`WebSocket server is running on port ${PORT}`);
+  initializeVoiceAgent();
+});
