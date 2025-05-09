@@ -27,7 +27,7 @@ export default function App() {
       const constraints = {
         audio: {
           channelCount: 1,
-          sampleRate: 44100,
+          sampleRate: 16000,
           echoCancellation: false,
           noiseSuppression: false,
           autoGainControl: false,
@@ -50,101 +50,53 @@ export default function App() {
       const ws = new WebSocket("ws://localhost:8001/ws");
       socketRef.current = ws;
 
+      // Initialize AudioContext for playing agent's responses
       audioContextRef.current = new AudioContext();
 
       ws.onopen = () => {
-        console.log("WebSocket connection opened successfully");
-        micRecorder.start(500);
+        console.log("WebSocket connection opened");
+        micRecorder.start(500); // start recording in 500ms chunks
         setIsRecording(true);
       };
 
-      ws.onerror = (event) => {
-        console.error("WebSocket error occurred");
-        console.error("Event:", event);
-        // Try to get more error details
-        if (event instanceof ErrorEvent) {
-          console.error("Error message:", event.message);
-          console.error("Error type:", event.type);
-        }
-      };
-
-      ws.onclose = (event) => {
-        console.log("WebSocket connection closed:", {
-          code: event.code,
-          reason: event.reason,
-          wasClean: event.wasClean,
-        });
-      };
-
-      micRecorder.ondataavailable = async (event) => {
-        if (event.data.size > 0) {
-          try {
-            // Send the raw audio data directly
-            console.log(
-              "Sending audio chunk to server, size:",
-              event.data.size
-            );
-            ws.send(event.data);
-          } catch (error) {
-            console.error("Error sending audio:", error);
-          }
-        }
-      };
-
       ws.onmessage = async (event) => {
-        try {
-          console.log("\n=== RECEIVED WEBSOCKET MESSAGE ===");
-          console.log("Raw message:", event.data);
-          const message = JSON.parse(event.data);
-          console.log("Parsed message:", message);
+        const message = JSON.parse(event.data);
 
-          switch (message.type) {
-            case "conversation":
-              console.log("Processing conversation message:", message.data);
-              const newTranscript = `${message.data.role}: ${message.data.content}`;
-              console.log("Adding to transcript:", newTranscript);
-              setTranscript((prev) => {
-                const updated = prev
-                  ? `${prev}\n${newTranscript}`
-                  : newTranscript;
-                console.log("Updated transcript:", updated);
-                return updated;
-              });
-              break;
+        switch (message.type) {
+          case "conversation":
+            setTranscript(
+              (prev) => `${prev}\n${message.data.role}: ${message.data.content}`
+            );
+            break;
 
-            case "audio":
-              console.log("Processing audio data, size:", message.data.length);
-              if (audioContextRef.current) {
-                try {
-                  // Convert the base64 audio data to ArrayBuffer
-                  const binaryString = atob(message.data);
-                  const bytes = new Uint8Array(binaryString.length);
-                  for (let i = 0; i < binaryString.length; i++) {
-                    bytes[i] = binaryString.charCodeAt(i);
-                  }
+          case "audio":
+            // Play the agent's audio response
+            if (audioContextRef.current) {
+              const audioData = new Uint8Array(message.data);
+              const audioBuffer = await audioContextRef.current.decodeAudioData(
+                audioData.buffer
+              );
+              const source = audioContextRef.current.createBufferSource();
+              source.buffer = audioBuffer;
+              source.connect(audioContextRef.current.destination);
+              source.start();
+            }
+            break;
 
-                  const audioBuffer =
-                    await audioContextRef.current.decodeAudioData(bytes.buffer);
-                  const source = audioContextRef.current.createBufferSource();
-                  source.buffer = audioBuffer;
-                  source.connect(audioContextRef.current.destination);
-                  source.start();
-                } catch (error) {
-                  console.error("Error playing audio:", error);
-                }
-              }
-              break;
+          case "error":
+            console.error("Error from server:", message.data);
+            break;
 
-            case "error":
-              console.error("Error from server:", message.data);
-              break;
+          case "connection_closed":
+            console.log("Connection closed by server");
+            break;
+        }
+      };
 
-            default:
-              console.log("Unknown message type:", message.type);
-          }
-        } catch (error) {
-          console.error("Error processing WebSocket message:", error);
-          console.error("Raw message that caused error:", event.data);
+      micRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunks.current.push(event.data);
+          ws.send(event.data);
         }
       };
 
@@ -165,19 +117,15 @@ export default function App() {
       console.log("Recording Stopped.");
       micRecorderRef.current.stop();
     }
-
-    // Wait for 5 seconds before closing the WebSocket to receive any pending responses
-    setTimeout(() => {
-      if (socketRef.current) {
-        console.log("Closing WebSocket connection after delay");
-        socketRef.current.close();
-      }
-    }, 5000);
+    if (socketRef.current) {
+      console.log("WebSocket connection closed");
+      socketRef.current.close();
+    }
   };
 
   return (
     <div className="flex flex-col items-center justify-center min-h-screen bg-gray-100">
-      <div className="p-8 bg-white rounded-lg shadow-md w-full max-w-2xl">
+      <div className="p-8 bg-white rounded-lg shadow-md">
         <h1 className="text-2xl font-bold mb-4">Voice Assistant</h1>
         <button
           onClick={isRecording ? stopRecording : startRecording}
@@ -194,32 +142,11 @@ export default function App() {
             Recording in progress...
           </div>
         )}
-        <div className="mt-6">
-          <h2 className="text-lg font-semibold mb-2">Conversation</h2>
-          <div className="bg-gray-50 rounded-lg p-4 h-96 overflow-y-auto">
-            {transcript ? (
-              transcript.split("\n").map((line, index) => {
-                const [role, content] = line.split(": ");
-                return (
-                  <div key={index} className="mb-3">
-                    <span
-                      className={`font-semibold ${
-                        role === "user" ? "text-blue-600" : "text-green-600"
-                      }`}
-                    >
-                      {role}:
-                    </span>
-                    <span className="ml-2">{content}</span>
-                  </div>
-                );
-              })
-            ) : (
-              <div className="text-gray-500 text-center">
-                Start speaking to begin the conversation...
-              </div>
-            )}
+        {transcript && (
+          <div className="mt-4 p-4 bg-gray-50 rounded-lg max-h-60 overflow-y-auto">
+            <pre className="whitespace-pre-wrap">{transcript}</pre>
           </div>
-        </div>
+        )}
       </div>
     </div>
   );

@@ -18,92 +18,62 @@ const wss = new WebSocketServer({ server });
 
 let agent = null;
 let audioBuffer = Buffer.alloc(0);
-let lastAudioChunkTime = Date.now();
 
 async function initializeVoiceAgent() {
   agent = deepgram.agent();
 
   agent.on(AgentEvents.Open, async () => {
-    console.log("\n=== AGENT CONNECTION OPENED ===");
-    console.log("Initializing agent configuration...");
-    try {
-      const config = {
-        audio: {
-          input: {
-            encoding: "linear16",
-            sampleRate: 44100,
-          },
-          output: {
-            encoding: "linear16",
-            sampleRate: 16000,
-            container: "wav",
-          },
-        },
-        agent: {
-          listen: {
-            model: "nova-3",
-          },
-          speak: {
-            model: "aura-asteria-en",
-          },
-          think: {
-            provider: {
-              type: "anthropic",
-            },
-            model: "claude-3-haiku-20240307",
-            instructions: prompt,
-          },
-        },
-      };
-      console.log("Agent configuration:", JSON.stringify(config, null, 2));
-      await agent.configure(config);
-      console.log("Agent configuration successful");
-      console.log("Agent state after configuration:", agent.state);
+    console.log("Connection opened");
 
-      // Add debug logging for all agent events
-      Object.values(AgentEvents).forEach((eventName) => {
-        agent.on(eventName, (data) => {
-          console.log(`\n=== AGENT EVENT: ${eventName} ===`);
-          console.log("Event data:", data);
-          console.log("========================\n");
-        });
-      });
+    await agent.configure({
+      audio: {
+        input: {
+          encoding: "linear16",
+          sampleRate: 16000,
+        },
+        output: {
+          encoding: "linear16",
+          sampleRate: 16000,
+          container: "wav",
+        },
+      },
+      agent: {
+        listen: {
+          model: "nova-3",
+        },
+        speak: {
+          model: "aura-asteria-en",
+        },
+        think: {
+          provider: {
+            type: "anthropic",
+          },
+          model: "claude-3-haiku-20240307",
+          instructions: prompt,
+        },
+      },
+    });
+    console.log("Voice agent configured");
 
-      setInterval(() => {
-        console.log("Keep alive! Agent state:", agent.state);
-        void agent.keepAlive();
-      }, 8000);
-    } catch (error) {
-      console.error("Error configuring agent:", error);
-      console.error("Error stack:", error.stack);
-    }
+    setInterval(() => {
+      console.log("Keep alive!");
+      void agent.keepAlive();
+    }, 8000);
   });
 
   agent.on(AgentEvents.AgentStartedSpeaking, (data) => {
-    console.log("\n=== AGENT STARTED SPEAKING ===");
-    console.log("Total latency:", data["total_latency"]);
-    console.log("=============================\n");
+    console.log("Agent started speaking:", data["total_latency"]);
   });
 
-  agent.on(AgentEvents.ConversationText, (data) => {
-    console.log("\n=== AGENT RESPONSE ===");
-    console.log("Full response data:", JSON.stringify(data, null, 2));
-    console.log("Role:", data.role);
-    console.log("Content:", data.content);
-    console.log(
-      "Time since last audio chunk:",
-      Date.now() - lastAudioChunkTime,
-      "ms"
-    );
-    console.log("========================\n");
-
+  agent.on(AgentEvents.ConversationText, (message) => {
+    console.log(`${message.role} said: ${message.content}`);
+    // Broadcast to all connected clients
     wss.clients.forEach((client) => {
       if (client.readyState === WebSocket.OPEN) {
-        console.log("Broadcasting conversation to client");
         client.send(
           JSON.stringify({
             type: "conversation",
-            data: data,
+            data: message,
           })
         );
       }
@@ -111,16 +81,6 @@ async function initializeVoiceAgent() {
   });
 
   agent.on(AgentEvents.Audio, (audio) => {
-    console.log("\n=== AGENT AUDIO ===");
-    console.log("Audio buffer size:", audio.length);
-    console.log("Audio first 100 bytes:", audio.slice(0, 100));
-    console.log(
-      "Time since last audio chunk:",
-      Date.now() - lastAudioChunkTime,
-      "ms"
-    );
-    console.log("===================\n");
-
     const buffer = Buffer.from(audio);
     audioBuffer = Buffer.concat([audioBuffer, buffer]);
     wss.clients.forEach((client) => {
@@ -136,10 +96,7 @@ async function initializeVoiceAgent() {
   });
 
   agent.on(AgentEvents.Error, (error) => {
-    console.error("\n=== AGENT ERROR ===");
-    console.error("Error details:", error);
-    console.error("===================\n");
-
+    console.error("Voice agent error:", error);
     wss.clients.forEach((client) => {
       if (client.readyState === WebSocket.OPEN) {
         client.send(
@@ -153,93 +110,34 @@ async function initializeVoiceAgent() {
   });
 
   agent.on(AgentEvents.Close, () => {
-    console.log("\n=== AGENT CONNECTION CLOSED ===\n");
+    console.log("Voice agent connection closed");
   });
 }
 
 // Handle WebSocket connections
 wss.on("connection", (ws) => {
-  console.log("\n=== NEW CLIENT CONNECTED ===");
-  console.log("Agent status:", agent ? "Initialized" : "Not initialized");
+  console.log("Socket connected");
 
   ws.on("message", (data) => {
-    console.log("\n=== RECEIVED AUDIO CHUNK ===");
-    console.log("Chunk size:", data.length);
-    console.log("Chunk type:", data.constructor.name);
-    console.log("Chunk first 100 bytes:", data.slice(0, 100));
-    console.log(
-      "Time since last chunk:",
-      Date.now() - lastAudioChunkTime,
-      "ms"
-    );
-
-    lastAudioChunkTime = Date.now();
     if (agent) {
-      try {
-        console.log("Sending chunk to agent...");
-        console.log("Agent state:", agent.state);
-        agent.send(data);
-        console.log("Chunk sent to agent successfully");
-      } catch (error) {
-        console.error("\n=== ERROR SENDING TO AGENT ===");
-        console.error("Error:", error);
-        console.error("Error stack:", error.stack);
-        console.error("=============================\n");
-
-        try {
-          ws.send(
-            JSON.stringify({
-              type: "error",
-              data: "Error sending audio to agent: " + error.message,
-            })
-          );
-        } catch (wsError) {
-          console.error("Error sending error message to client:", wsError);
-        }
-      }
+      agent.send(data);
     } else {
-      console.error("\n=== AGENT NOT INITIALIZED ===\n");
-      try {
-        ws.send(
-          JSON.stringify({
-            type: "error",
-            data: "Voice agent not ready",
-          })
-        );
-      } catch (wsError) {
-        console.error("Error sending error message to client:", wsError);
-      }
+      ws.send(
+        JSON.stringify({
+          type: "error",
+          data: "Voice agent not ready",
+        })
+      );
     }
   });
 
-  ws.on("close", (code, reason) => {
-    console.log("\n=== CLIENT DISCONNECTED ===");
-    console.log("Close code:", code);
-    console.log("Close reason:", reason);
-    console.log(
-      "Time since last audio chunk:",
-      Date.now() - lastAudioChunkTime,
-      "ms"
-    );
-    console.log("===========================\n");
+  ws.on("close", () => {
+    console.log("Client disconnected");
   });
-
-  ws.on("error", (error) => {
-    console.error("\n=== WEBSOCKET SERVER ERROR ===");
-    console.error("Error:", error);
-    console.error("=============================\n");
-  });
-});
-
-// Add error handler for the WebSocket server
-wss.on("error", (error) => {
-  console.error("\n=== WEBSOCKET SERVER ERROR ===");
-  console.error("Error:", error);
-  console.error("=============================\n");
 });
 
 const PORT = process.env.PORT || 8001;
-const serverInstance = server.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log(`WebSocket server is running on port ${PORT}`);
   initializeVoiceAgent();
 });
