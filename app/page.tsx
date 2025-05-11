@@ -4,11 +4,9 @@ import { useEffect, useRef, useState } from "react";
 
 export default function App() {
   const [isRecording, setIsRecording] = useState(false);
-  const [transcript, setTranscript] = useState("");
   const micRecorderRef = useRef<MediaRecorder | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
-  const audioChunks = useRef<Blob[]>([]);
-  const audioContextRef = useRef<AudioContext | null>(null);
+  const workletNodeRef = useRef<AudioWorkletNode | null>(null);
 
   useEffect(() => {
     return () => {
@@ -24,88 +22,28 @@ export default function App() {
 
   const startRecording = async () => {
     try {
-      const constraints = {
-        audio: {
-          channelCount: 1,
-          sampleRate: 16000,
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
-          latency: 0,
-          googEchoCancellation: false,
-          googAutoGainControl: false,
-          googNoiseSuppression: false,
-          googHighpassFilter: true,
-        },
-      };
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const audioContext = new AudioContext();
 
-      const stream = await navigator.mediaDevices.getUserMedia(constraints);
-      const micRecorder = new MediaRecorder(stream, {
-        mimeType: "audio/webm",
-      });
+      // Load and setup AudioWorklet
+      await audioContext.audioWorklet.addModule("/audio-processor.js");
+      const workletNode = new AudioWorkletNode(audioContext, "audio-processor");
 
-      micRecorderRef.current = micRecorder;
-      audioChunks.current = [];
-
-      const ws = new WebSocket("ws://localhost:8001/ws");
-      socketRef.current = ws;
-
-      // Initialize AudioContext for playing agent's responses
-      audioContextRef.current = new AudioContext();
-
-      ws.onopen = () => {
-        console.log("WebSocket connection opened");
-        micRecorder.start(500); // start recording in 500ms chunks
-        setIsRecording(true);
-      };
-
-      ws.onmessage = async (event) => {
-        const message = JSON.parse(event.data);
-
-        switch (message.type) {
-          case "conversation":
-            setTranscript(
-              (prev) => `${prev}\n${message.data.role}: ${message.data.content}`
-            );
-            break;
-
-          case "audio":
-            // Play the agent's audio response
-            if (audioContextRef.current) {
-              const audioData = new Uint8Array(message.data);
-              const audioBuffer = await audioContextRef.current.decodeAudioData(
-                audioData.buffer
-              );
-              const source = audioContextRef.current.createBufferSource();
-              source.buffer = audioBuffer;
-              source.connect(audioContextRef.current.destination);
-              source.start();
-            }
-            break;
-
-          case "error":
-            console.error("Error from server:", message.data);
-            break;
-
-          case "connection_closed":
-            console.log("Connection closed by server");
-            break;
+      workletNode.port.onmessage = (e) => {
+        if (socketRef.current?.readyState === WebSocket.OPEN) {
+          const pcmData = convertFloatToPcm(new Float32Array(e.data));
+          console.log(pcmData);
+          socketRef.current.send(pcmData.buffer);
         }
       };
 
-      micRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          audioChunks.current.push(event.data);
-          ws.send(event.data);
-        }
-      };
+      const source = audioContext.createMediaStreamSource(stream);
+      source.connect(workletNode);
+      workletNode.connect(audioContext.destination);
 
-      micRecorder.onstop = () => {
-        stream.getTracks().forEach((track) => track.stop());
-        setIsRecording(false);
-      };
+      workletNodeRef.current = workletNode;
     } catch (error) {
-      console.error("Error accessing microphone:", error);
+      console.error("Audio setup failed:", error);
     }
   };
 
@@ -142,12 +80,15 @@ export default function App() {
             Recording in progress...
           </div>
         )}
-        {transcript && (
-          <div className="mt-4 p-4 bg-gray-50 rounded-lg max-h-60 overflow-y-auto">
-            <pre className="whitespace-pre-wrap">{transcript}</pre>
-          </div>
-        )}
       </div>
     </div>
   );
 }
+
+const convertFloatToPcm = (float32: Float32Array): Int16Array => {
+  const int16 = new Int16Array(float32.length);
+  for (let i = 0; i < float32.length; i++) {
+    int16[i] = Math.max(-32768, Math.min(32767, float32[i] * 32768));
+  }
+  return int16;
+};
