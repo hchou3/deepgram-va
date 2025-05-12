@@ -2,38 +2,136 @@
 import React from "react";
 import { useEffect, useRef, useState } from "react";
 
+let audioContext: AudioContext | null = null;
+
 export default function App() {
-  const [isRecording, setIsRecording] = useState(false);
-  const micRecorderRef = useRef<MediaRecorder | null>(null);
+  const [agentStatus, setAgentStatus] = useState("Agent is ready");
+  const [isSilent, setIsSilent] = useState(true);
   const socketRef = useRef<WebSocket | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+
+  let audioQueue: Int16Array[] = [];
+  let isPlaying = false;
 
   useEffect(() => {
+    if (typeof window !== "undefined") {
+      if (!audioContextRef.current) {
+        audioContextRef.current =
+          audioContext ||
+          new (window.AudioContext || (window as any).webkitAudioContext)();
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    const connectWebSocket = () => {
+      const socket = new WebSocket("ws://localhost:8001");
+      socketRef.current = socket;
+
+      socket.onopen = () => {
+        startRecording(); // Automatically start recording
+      };
+
+      socket.onmessage = async (event) => {
+        if (event.data instanceof Blob) {
+          try {
+            const arrayBuffer = await event.data.arrayBuffer();
+            const audioData = new Int16Array(arrayBuffer);
+
+            // Add to queue instead of playing immediately
+            audioQueue.push(audioData);
+            if (!isPlaying) {
+              playNextInQueue();
+            }
+          } catch (error) {}
+        } else {
+          try {
+            const message = JSON.parse(event.data);
+
+            if (message.type === "conversation") {
+              setAgentStatus("Agent is speaking...");
+            }
+          } catch (error) {}
+        }
+      };
+
+      socket.onclose = () => {
+        setTimeout(connectWebSocket, 3000);
+      };
+
+      socket.onerror = (error) => {};
+    };
+
+    connectWebSocket();
+
     return () => {
-      if (socketRef.current) socketRef.current.close();
-      if (
-        micRecorderRef.current &&
-        micRecorderRef.current.state === "recording"
-      ) {
-        micRecorderRef.current.stop();
+      if (socketRef.current) {
+        socketRef.current.close();
       }
     };
   }, []);
 
   const startRecording = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const audioContext = new AudioContext();
+      if (
+        !socketRef.current ||
+        socketRef.current.readyState !== WebSocket.OPEN
+      ) {
+        return;
+      }
 
-      // Load and setup AudioWorklet
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+      const audioContext = audioContextRef.current;
+
+      if (!audioContext) {
+        return;
+      }
+
+      if (audioContext.state === "suspended") {
+        await audioContext.resume();
+      }
+
       await audioContext.audioWorklet.addModule("/audio-processor.js");
       const workletNode = new AudioWorkletNode(audioContext, "audio-processor");
 
+      let silenceDebounceTimeout: NodeJS.Timeout | null = null;
+      const silenceDebounceDelay = 300; // 300ms debounce delay
+
       workletNode.port.onmessage = (e) => {
-        if (socketRef.current?.readyState === WebSocket.OPEN) {
-          const pcmData = convertFloatToPcm(new Float32Array(e.data));
-          console.log(pcmData);
+        const float32Array = new Float32Array(e.data);
+        const rms = Math.sqrt(
+          float32Array.reduce((sum, sample) => sum + sample * sample, 0) /
+            float32Array.length
+        );
+
+        const speechThreshold = 0.02;
+
+        if (rms > speechThreshold) {
+          if (isSilent) {
+            setIsSilent(false);
+            setAgentStatus("Agent is listening...");
+          }
+
+          const pcmData = convertFloatToPcm(float32Array);
           socketRef.current.send(pcmData.buffer);
+          console.log("Sent PCM data to WebSocket server");
+
+          if (silenceDebounceTimeout) {
+            clearTimeout(silenceDebounceTimeout);
+            silenceDebounceTimeout = null;
+          }
+        } else {
+          if (!isSilent) {
+            if (!silenceDebounceTimeout) {
+              silenceDebounceTimeout = setTimeout(() => {
+                setIsSilent(true);
+                setAgentStatus("Agent is ready");
+                silenceDebounceTimeout = null;
+              }, silenceDebounceDelay);
+            }
+          }
         }
       };
 
@@ -42,44 +140,108 @@ export default function App() {
       workletNode.connect(audioContext.destination);
 
       workletNodeRef.current = workletNode;
-    } catch (error) {
-      console.error("Audio setup failed:", error);
-    }
+    } catch (error) {}
   };
 
-  const stopRecording = () => {
-    if (
-      micRecorderRef.current &&
-      micRecorderRef.current.state === "recording"
-    ) {
-      console.log("Recording Stopped.");
-      micRecorderRef.current.stop();
+  async function resampleAudio(
+    audioData: Int16Array,
+    fromSampleRate: number,
+    toSampleRate: number
+  ): Promise<Float32Array> {
+    if (fromSampleRate === toSampleRate) {
+      // No resampling needed
+      return Float32Array.from(
+        audioData,
+        (sample) => sample / (sample >= 0 ? 0x7fff : 0x8000)
+      );
     }
-    if (socketRef.current) {
-      console.log("WebSocket connection closed");
-      socketRef.current.close();
+
+    const resampleRatio = toSampleRate / fromSampleRate;
+    const newLength = Math.round(audioData.length * resampleRatio);
+    const resampledData = new Float32Array(newLength);
+
+    for (let i = 0; i < newLength; i++) {
+      const originalIndex = i / resampleRatio;
+      const lowerIndex = Math.floor(originalIndex);
+      const upperIndex = Math.min(
+        Math.ceil(originalIndex),
+        audioData.length - 1
+      );
+      const weight = originalIndex - lowerIndex;
+
+      resampledData[i] =
+        (audioData[lowerIndex] * (1 - weight) +
+          audioData[upperIndex] * weight) /
+        (audioData[lowerIndex] >= 0 ? 0x7fff : 0x8000);
     }
-  };
+
+    return resampledData;
+  }
+
+  async function playNextInQueue() {
+    if (audioQueue.length === 0) {
+      isPlaying = false;
+      setAgentStatus("Agent is ready");
+      return;
+    }
+
+    isPlaying = true;
+    const audioData = audioQueue.shift();
+
+    try {
+      const audioContext = audioContextRef.current;
+
+      if (!audioContext) {
+        return;
+      }
+
+      // Ensure audio context is running
+      if (audioContext.state === "suspended") {
+        await audioContext.resume();
+      }
+
+      // Resample audio to match AudioContext sample rate
+      const resampledData = await resampleAudio(
+        audioData,
+        24000,
+        audioContext.sampleRate
+      );
+
+      // Create buffer with correct sample rate for agent's audio
+      const buffer = audioContext.createBuffer(
+        1,
+        resampledData.length,
+        audioContext.sampleRate
+      );
+      const channelData = buffer.getChannelData(0);
+      channelData.set(resampledData);
+
+      const source = audioContext.createBufferSource();
+      source.buffer = buffer;
+
+      const gainNode = audioContext.createGain();
+      gainNode.gain.value = 1.0;
+
+      source.connect(gainNode);
+      gainNode.connect(audioContext.destination);
+
+      source.onended = () => {
+        playNextInQueue();
+      };
+
+      source.start(0);
+      setAgentStatus("Agent is speaking...");
+    } catch (error) {
+      isPlaying = false;
+      playNextInQueue();
+    }
+  }
 
   return (
     <div className="flex flex-col items-center justify-center min-h-screen bg-gray-100">
       <div className="p-8 bg-white rounded-lg shadow-md">
         <h1 className="text-2xl font-bold mb-4">Voice Assistant</h1>
-        <button
-          onClick={isRecording ? stopRecording : startRecording}
-          className={`px-4 py-2 rounded-full ${
-            isRecording
-              ? "bg-red-500 hover:bg-red-600"
-              : "bg-blue-500 hover:bg-blue-600"
-          } text-white transition-colors`}
-        >
-          {isRecording ? "Stop Recording" : "Start Recording"}
-        </button>
-        {isRecording && (
-          <div className="mt-4 text-center text-gray-600">
-            Recording in progress...
-          </div>
-        )}
+        <div className="mt-4 text-center text-gray-600">{agentStatus}</div>
       </div>
     </div>
   );

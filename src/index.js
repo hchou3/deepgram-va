@@ -22,37 +22,46 @@ let audioBuffer = Buffer.alloc(0);
 async function initializeVoiceAgent() {
   agent = deepgram.agent();
 
-  agent.on(AgentEvents.Open, async () => {
-    console.log("Connection opened");
+  agent.on(AgentEvents.Welcome, async () => {
+    console.log("Welcome to the Deepgram Voice Agent!");
 
     await agent.configure({
       audio: {
         input: {
           encoding: "linear16",
-          sampleRate: 16000,
+          sample_rate: 24000,
         },
         output: {
           encoding: "linear16",
-          sampleRate: 16000,
-          container: "wav",
+          sample_rate: 24000,
+          container: "none",
         },
       },
       agent: {
+        language: "en",
         listen: {
-          model: "nova-3",
-        },
-        speak: {
-          model: "aura-asteria-en",
+          provider: {
+            type: "deepgram",
+            model: "nova-3",
+          },
         },
         think: {
           provider: {
-            type: "anthropic",
+            type: "open_ai",
+            model: "gpt-4o-mini",
           },
-          model: "claude-3-haiku-20240307",
-          instructions: prompt,
+          prompt: "You are a friendly AI assistant.",
         },
+        speak: {
+          provider: {
+            type: "deepgram",
+            model: "aura-2-thalia-en",
+          },
+        },
+        greeting: "Hello! How can I help you today?",
       },
     });
+
     console.log("Voice agent configured");
 
     setInterval(() => {
@@ -61,15 +70,30 @@ async function initializeVoiceAgent() {
     }, 8000);
   });
 
-  agent.on(AgentEvents.AgentStartedSpeaking, (data) => {
-    console.log("Agent started speaking:", data["total_latency"]);
+  agent.on(AgentEvents.Open, () => {
+    console.log("Connection opened");
+  });
+
+  agent.on(AgentEvents.Close, () => {
+    console.log("Voice agent connection closed");
+  });
+
+  agent.on(AgentEvents.Error, (error) => {
+    console.error("Voice agent error:", JSON.stringify(error, null, 2));
   });
 
   agent.on(AgentEvents.ConversationText, (message) => {
-    console.log(`${message.role} said: ${message.content}`);
-    // Broadcast to all connected clients
+    console.log("AgentEvents.ConversationText triggered:", {
+      role: message.role,
+      content: message.content,
+    });
+
     wss.clients.forEach((client) => {
       if (client.readyState === WebSocket.OPEN) {
+        console.log("Sending conversation text to client:", {
+          clientReadyState: client.readyState,
+          messageContent: message.content,
+        });
         client.send(
           JSON.stringify({
             type: "conversation",
@@ -82,9 +106,18 @@ async function initializeVoiceAgent() {
 
   agent.on(AgentEvents.Audio, (audio) => {
     const buffer = Buffer.from(audio);
-    audioBuffer = Buffer.concat([audioBuffer, buffer]);
+    console.log("AgentEvents.Audio triggered:", {
+      bufferLength: buffer.length,
+      sampleRate: 24000,
+      format: "linear16",
+    });
+
     wss.clients.forEach((client) => {
       if (client.readyState === WebSocket.OPEN) {
+        console.log("Sending audio data to client:", {
+          clientReadyState: client.readyState,
+          bufferLength: buffer.length,
+        });
         client.send(
           JSON.stringify({
             type: "audio",
@@ -95,32 +128,18 @@ async function initializeVoiceAgent() {
     });
   });
 
-  agent.on(AgentEvents.Error, (error) => {
-    console.error("Voice agent error:", error);
-    wss.clients.forEach((client) => {
-      if (client.readyState === WebSocket.OPEN) {
-        client.send(
-          JSON.stringify({
-            type: "error",
-            data: error.message,
-          })
-        );
-      }
-    });
-  });
-
-  agent.on(AgentEvents.Close, () => {
-    console.log("Voice agent connection closed");
+  agent.on(AgentEvents.Unhandled, (data) => {
+    console.log("Unhandled event:", data);
   });
 }
 
-// Handle WebSocket connections
 wss.on("connection", (ws) => {
   console.log("Socket connected");
 
   ws.on("message", (data) => {
     if (agent) {
       agent.send(data);
+      console.log("Sent data to agent:", data.length);
     } else {
       ws.send(
         JSON.stringify({
