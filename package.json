@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start",
+    "start": "npx ts-node src/index.ts",
     "lint": "next lint"
   },
   "dependencies": {
@@ -17,9 +17,14 @@
     "next": "^15.3.1",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
-    "ws": "^8.16.0"
+    "ws": "^8.18.2"
   },
   "devDependencies": {
-    "typescript": "5.8.3"
+    "@types/express": "^5.0.1",
+    "@types/node": "^22.15.17",
+    "@types/ws": "^8.18.1",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
   }
 }

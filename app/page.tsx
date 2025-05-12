@@ -26,33 +26,48 @@ export default function App() {
 
   useEffect(() => {
     const connectWebSocket = () => {
-      const socket = new WebSocket("ws://localhost:8001");
+      const socket = new WebSocket("ws://localhost:8000");
       socketRef.current = socket;
 
       socket.onopen = () => {
         startRecording(); // Automatically start recording
       };
 
+      // Added debug logs to verify audio data reception and queue addition
       socket.onmessage = async (event) => {
         if (event.data instanceof Blob) {
           try {
+            console.log("Processing audio Blob...");
             const arrayBuffer = await event.data.arrayBuffer();
             const audioData = new Int16Array(arrayBuffer);
+            console.log("Audio data received:", {
+              length: audioData.length,
+              sampleRate: 16000,
+              format: "linear16",
+            });
 
             // Add to queue instead of playing immediately
             audioQueue.push(audioData);
+            console.log(
+              "Audio data added to queue. Queue length:",
+              audioQueue.length
+            );
+
             if (!isPlaying) {
               playNextInQueue();
             }
-          } catch (error) {}
+          } catch (error) {
+            console.error("Error processing audio response:", error);
+          }
         } else {
           try {
             const message = JSON.parse(event.data);
-
             if (message.type === "conversation") {
               setAgentStatus("Agent is speaking...");
             }
-          } catch (error) {}
+          } catch (error) {
+            console.error("Error parsing WebSocket message:", error);
+          }
         }
       };
 
@@ -115,8 +130,18 @@ export default function App() {
           }
 
           const pcmData = convertFloatToPcm(float32Array);
-          socketRef.current.send(pcmData.buffer);
+          if (socketRef.current) {
+            socketRef.current.send(pcmData.buffer);
+          }
           console.log("Sent PCM data to WebSocket server");
+
+          // Added detailed logging for PCM data sent to the WebSocket
+          console.log("PCM data metadata:", {
+            bufferLength: pcmData.buffer.byteLength,
+            dataType: typeof pcmData,
+            sampleRate: 24000, // Assuming a fixed sample rate
+            timestamp: new Date().toISOString(),
+          });
 
           if (silenceDebounceTimeout) {
             clearTimeout(silenceDebounceTimeout);
@@ -143,13 +168,20 @@ export default function App() {
     } catch (error) {}
   };
 
+  // Added debug logs to verify resampling logic
   async function resampleAudio(
     audioData: Int16Array,
     fromSampleRate: number,
     toSampleRate: number
   ): Promise<Float32Array> {
+    console.log("Resampling audio:", {
+      inputLength: audioData.length,
+      fromSampleRate,
+      toSampleRate,
+    });
+
     if (fromSampleRate === toSampleRate) {
-      // No resampling needed
+      console.log("No resampling needed. Returning original data.");
       return Float32Array.from(
         audioData,
         (sample) => sample / (sample >= 0 ? 0x7fff : 0x8000)
@@ -174,6 +206,11 @@ export default function App() {
           audioData[upperIndex] * weight) /
         (audioData[lowerIndex] >= 0 ? 0x7fff : 0x8000);
     }
+
+    console.log("Resampled audio:", {
+      outputLength: resampledData.length,
+      toSampleRate,
+    });
 
     return resampledData;
   }
@@ -201,35 +238,61 @@ export default function App() {
       }
 
       // Resample audio to match AudioContext sample rate
+      if (!audioData) {
+        console.error("Audio data is undefined. Skipping resampling.");
+        isPlaying = false;
+        playNextInQueue();
+        return;
+      }
+
       const resampledData = await resampleAudio(
         audioData,
         24000,
         audioContext.sampleRate
       );
 
+      // Added debug logs to verify buffer creation
       // Create buffer with correct sample rate for agent's audio
       const buffer = audioContext.createBuffer(
         1,
         resampledData.length,
         audioContext.sampleRate
       );
+      console.log("AudioBuffer created:", {
+        bufferLength: buffer.length,
+        sampleRate: audioContext.sampleRate,
+      });
+
       const channelData = buffer.getChannelData(0);
       channelData.set(resampledData);
+      console.log("Channel data set in AudioBuffer");
 
+      // Added debug logs to verify playback process
       const source = audioContext.createBufferSource();
       source.buffer = buffer;
+      console.log("AudioBufferSourceNode created and buffer assigned");
 
+      // Added debug logs to verify volume control
       const gainNode = audioContext.createGain();
       gainNode.gain.value = 1.0;
+      console.log("GainNode initialized with gain value:", gainNode.gain.value);
+
+      // Log gain value manually if modified in the future
+      console.log("Ensure gain value remains consistent during playback");
 
       source.connect(gainNode);
       gainNode.connect(audioContext.destination);
+      console.log(
+        "AudioBufferSourceNode connected to GainNode and destination"
+      );
 
       source.onended = () => {
+        console.log("Audio playback ended. Playing next in queue...");
         playNextInQueue();
       };
 
       source.start(0);
+      console.log("Audio playback started");
       setAgentStatus("Agent is speaking...");
     } catch (error) {
       isPlaying = false;
