@@ -4,6 +4,10 @@ import { useEffect, useRef, useState } from "react";
 
 let audioContext: AudioContext | null = null;
 
+// Buffer for accumulating audio samples before sending
+let sendBuffer = new Int16Array(0);
+const CHUNK_SIZE = 2048; // ~85ms at 24kHz, matches peer's implementation
+
 export default function App() {
   const [agentStatus, setAgentStatus] = useState("Agent is ready");
   const [isSilent, setIsSilent] = useState(true);
@@ -19,7 +23,9 @@ export default function App() {
       if (!audioContextRef.current) {
         audioContextRef.current =
           audioContext ||
-          new (window.AudioContext || (window as any).webkitAudioContext)();
+          new (window.AudioContext || (window as any).webkitAudioContext)({
+            sampleRate: 24000,
+          });
       }
     }
   }, []);
@@ -95,9 +101,21 @@ export default function App() {
       ) {
         return;
       }
-
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-
+      const constraints = {
+        audio: {
+          channelCount: 1,
+          sampleRate: 24000,
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+          latency: 0,
+          googEchoCancellation: false,
+          googAutoGainControl: false,
+          googNoiseSuppression: false,
+          googHighpassFilter: true,
+        },
+      };
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
       const audioContext = audioContextRef.current;
 
       if (!audioContext) {
@@ -111,52 +129,34 @@ export default function App() {
       await audioContext.audioWorklet.addModule("/audio-processor.js");
       const workletNode = new AudioWorkletNode(audioContext, "audio-processor");
 
-      let silenceDebounceTimeout: NodeJS.Timeout | null = null;
-      const silenceDebounceDelay = 300; // 300ms debounce delay
-
       workletNode.port.onmessage = (e) => {
+        // No silence detection: always process every buffer
         const float32Array = new Float32Array(e.data);
-        const rms = Math.sqrt(
-          float32Array.reduce((sum, sample) => sum + sample * sample, 0) /
-            float32Array.length
-        );
+        const int16Array = new Int16Array(float32Array.length);
+        for (let i = 0; i < float32Array.length; i++) {
+          const sample = Math.max(-1, Math.min(1, float32Array[i]));
+          int16Array[i] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+        }
 
-        const speechThreshold = 0.02;
+        // Concatenate new samples to the sendBuffer
+        const combined = new Int16Array(sendBuffer.length + int16Array.length);
+        combined.set(sendBuffer, 0);
+        combined.set(int16Array, sendBuffer.length);
+        sendBuffer = combined;
 
-        if (rms > speechThreshold) {
-          if (isSilent) {
-            setIsSilent(false);
-            setAgentStatus("Agent is listening...");
-          }
-
-          const pcmData = convertFloatToPcm(float32Array);
+        // Send in CHUNK_SIZE blocks
+        while (sendBuffer.length >= CHUNK_SIZE) {
+          const chunk = sendBuffer.slice(0, CHUNK_SIZE);
           if (socketRef.current) {
-            socketRef.current.send(pcmData.buffer);
+            console.log("About to send binary audio chunk:", {
+              bufferType: Object.prototype.toString.call(chunk.buffer),
+              byteLength: chunk.buffer.byteLength,
+              firstBytes: Array.from(new Uint8Array(chunk.buffer).slice(0, 8)),
+            });
+            socketRef.current.send(chunk.buffer);
+            console.log("Sent binary audio chunk to WebSocket server");
           }
-          console.log("Sent PCM data to WebSocket server");
-
-          // Added detailed logging for PCM data sent to the WebSocket
-          console.log("PCM data metadata:", {
-            bufferLength: pcmData.buffer.byteLength,
-            dataType: typeof pcmData,
-            sampleRate: 24000, // Assuming a fixed sample rate
-            timestamp: new Date().toISOString(),
-          });
-
-          if (silenceDebounceTimeout) {
-            clearTimeout(silenceDebounceTimeout);
-            silenceDebounceTimeout = null;
-          }
-        } else {
-          if (!isSilent) {
-            if (!silenceDebounceTimeout) {
-              silenceDebounceTimeout = setTimeout(() => {
-                setIsSilent(true);
-                setAgentStatus("Agent is ready");
-                silenceDebounceTimeout = null;
-              }, silenceDebounceDelay);
-            }
-          }
+          sendBuffer = sendBuffer.slice(CHUNK_SIZE);
         }
       };
 
@@ -167,53 +167,6 @@ export default function App() {
       workletNodeRef.current = workletNode;
     } catch (error) {}
   };
-
-  // Added debug logs to verify resampling logic
-  async function resampleAudio(
-    audioData: Int16Array,
-    fromSampleRate: number,
-    toSampleRate: number
-  ): Promise<Float32Array> {
-    console.log("Resampling audio:", {
-      inputLength: audioData.length,
-      fromSampleRate,
-      toSampleRate,
-    });
-
-    if (fromSampleRate === toSampleRate) {
-      console.log("No resampling needed. Returning original data.");
-      return Float32Array.from(
-        audioData,
-        (sample) => sample / (sample >= 0 ? 0x7fff : 0x8000)
-      );
-    }
-
-    const resampleRatio = toSampleRate / fromSampleRate;
-    const newLength = Math.round(audioData.length * resampleRatio);
-    const resampledData = new Float32Array(newLength);
-
-    for (let i = 0; i < newLength; i++) {
-      const originalIndex = i / resampleRatio;
-      const lowerIndex = Math.floor(originalIndex);
-      const upperIndex = Math.min(
-        Math.ceil(originalIndex),
-        audioData.length - 1
-      );
-      const weight = originalIndex - lowerIndex;
-
-      resampledData[i] =
-        (audioData[lowerIndex] * (1 - weight) +
-          audioData[upperIndex] * weight) /
-        (audioData[lowerIndex] >= 0 ? 0x7fff : 0x8000);
-    }
-
-    console.log("Resampled audio:", {
-      outputLength: resampledData.length,
-      toSampleRate,
-    });
-
-    return resampledData;
-  }
 
   async function playNextInQueue() {
     if (audioQueue.length === 0) {
@@ -237,34 +190,28 @@ export default function App() {
         await audioContext.resume();
       }
 
-      // Resample audio to match AudioContext sample rate
       if (!audioData) {
-        console.error("Audio data is undefined. Skipping resampling.");
+        console.error("Audio data is undefined. Skipping playback.");
         isPlaying = false;
         playNextInQueue();
         return;
       }
 
-      const resampledData = await resampleAudio(
-        audioData,
-        24000,
-        audioContext.sampleRate
-      );
-
       // Added debug logs to verify buffer creation
       // Create buffer with correct sample rate for agent's audio
-      const buffer = audioContext.createBuffer(
-        1,
-        resampledData.length,
-        audioContext.sampleRate
-      );
+      const buffer = audioContext.createBuffer(1, audioData.length, 24000);
       console.log("AudioBuffer created:", {
         bufferLength: buffer.length,
-        sampleRate: audioContext.sampleRate,
+        sampleRate: 24000,
       });
 
       const channelData = buffer.getChannelData(0);
-      channelData.set(resampledData);
+      channelData.set(
+        Float32Array.from(
+          audioData,
+          (sample) => sample / (sample >= 0 ? 0x7fff : 0x8000)
+        )
+      );
       console.log("Channel data set in AudioBuffer");
 
       // Added debug logs to verify playback process

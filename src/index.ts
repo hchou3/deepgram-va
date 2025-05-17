@@ -1,8 +1,6 @@
 import { createClient, AgentEvents } from "@deepgram/sdk";
 import { WebSocketServer, WebSocket } from "ws";
 import * as http from "http";
-import * as fs from "fs";
-import * as path from "path";
 import * as dotenv from "dotenv";
 
 // Load environment variables
@@ -17,21 +15,23 @@ if (!DEEPGRAM_API_KEY) {
 const deepgram = createClient(DEEPGRAM_API_KEY);
 const server = http.createServer();
 
+const wss = new WebSocketServer({ server });
+let browserWs: WebSocket | null = null;
+
 async function connectToAgent() {
   try {
     const agent = deepgram.agent();
     agent.on(AgentEvents.Open, () => {
-      console.log("Agent connection established");
       agent.configure({
         audio: {
           input: {
             encoding: "linear16",
-            sample_rate: 16000,
+            sample_rate: 24000,
           },
           output: {
             encoding: "linear16",
-            sample_rate: 16000,
-            container: "wav",
+            sample_rate: 24000,
+            container: "none",
           },
         },
         agent: {
@@ -63,7 +63,8 @@ async function connectToAgent() {
     agent.on(
       AgentEvents.AgentStartedSpeaking,
       (data: { total_latency: number }) => {
-        // Remove unnecessary latency logging
+        console.log("Agent started speaking");
+        console.log("Total latency:", data.total_latency);
       }
     );
 
@@ -74,13 +75,13 @@ async function connectToAgent() {
       }
     );
 
-    agent.on(AgentEvents.Audio, (audio: Buffer) => {
+    agent.on(AgentEvents.Audio, (data: Buffer) => {
       if (browserWs?.readyState === WebSocket.OPEN) {
         try {
-          console.log("audio", audio);
-          browserWs.send(audio);
+          console.log("Sending audio to React app");
+          browserWs.send(data, { binary: true });
         } catch (error) {
-          console.error("Error sending audio to browser:", error);
+          console.error("Error sending audio to React app:", error);
         }
       }
     });
@@ -91,9 +92,6 @@ async function connectToAgent() {
 
     agent.on(AgentEvents.Close, () => {
       console.log("Agent connection closed");
-      if (browserWs?.readyState === WebSocket.OPEN) {
-        browserWs.close();
-      }
     });
 
     return agent;
@@ -103,51 +101,27 @@ async function connectToAgent() {
   }
 }
 
-// Create WebSocket server for browser clients
-const wss = new WebSocketServer({ server });
-let browserWs: WebSocket | null = null;
-
 wss.on("connection", async (ws) => {
-  console.log("Browser client connected");
+  console.log("React app connected");
   browserWs = ws;
 
   const agent = await connectToAgent();
 
   ws.on("message", (data: Buffer) => {
     try {
-      if (agent) {
-        console.log("data", data);
-        agent.send(data);
-      }
-    } catch (error) {
-      console.error("Error sending audio to agent:", error);
-    }
-  });
+      // Log metadata about the audio data
+      console.log("Audio data metadata:", {
+        byteLength: data.byteLength,
+        isBuffer: Buffer.isBuffer(data),
+        dataType: typeof data,
+      });
 
-  ws.on("close", async () => {
-    if (agent) {
-      await agent.disconnect();
-    }
-    browserWs = null;
-    console.log("Browser client disconnected");
-  });
-
-  ws.on("error", (error) => {
-    console.error("WebSocket error:", error);
-  });
-});
-
-// Add a new WebSocket endpoint to handle interactions with the React app
-wss.on("connection", async (ws) => {
-  console.log("React app connected");
-
-  const agent = await connectToAgent();
-
-  ws.on("message", (data: string) => {
-    try {
-      const message = JSON.parse(data);
-      if (message.type === "user_input" && agent) {
-        agent.send(Buffer.from(message.content).buffer);
+      if (Buffer.isBuffer(data)) {
+        agent.send(
+          data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)
+        );
+      } else {
+        console.error("Received data is not binary");
       }
     } catch (error) {
       console.error("Error processing message from React app:", error);
@@ -158,6 +132,7 @@ wss.on("connection", async (ws) => {
     if (agent) {
       await agent.disconnect();
     }
+    browserWs = null;
     console.log("React app disconnected");
   });
 
